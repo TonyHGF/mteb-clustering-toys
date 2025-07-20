@@ -3,15 +3,15 @@ import os
 import torch
 from transformers import AutoModel, AutoTokenizer
 from peft import PeftModel
+import mteb
 import numpy as np
 import psutil
 import pandas as pd
 import matplotlib.pyplot as plt
-from datasets import load_dataset
-from sklearn.cluster import MiniBatchKMeans
+import matplotlib.cm as cm
 from sklearn.manifold import TSNE
 from sklearn.metrics import silhouette_samples, silhouette_score, confusion_matrix
-from math import comb, log
+from sklearn.cluster import KMeans
 from embedding_model import EmbeddingModel, print_hw_status
 
 
@@ -27,8 +27,8 @@ task_names = [
     "BiorxivClusteringP2P.v2"
 ]
 
-if __name__ == '__main__':
-    # === Load model + tokenizer ===
+def main():
+    # === Load base + LoRA ===
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Loading base model from {base_model_path} on {device}...")
     base = AutoModel.from_pretrained(
@@ -43,93 +43,101 @@ if __name__ == '__main__':
     tokenizer.pad_token = tokenizer.eos_token
     model.config.pad_token_id = tokenizer.pad_token_id
 
-    print("\nHardware status:")
+    print("\n=== Hardware status ===")
     print_hw_status()
+    print("=======================\n")
 
-    # === Wrap model ===
+    # === MTEB setup ===
+    task_names = [
+        "ArxivClustering-p2p",
+        "ArXivHierarchicalClusteringS2S",
+        "MedrxivClusteringP2P.v2",
+        "MedrxivClusteringS2S.v2",
+        "BiorxivClusteringS2S.v2",
+        "BiorxivClusteringP2P.v2"
+    ]
+    tasks = mteb.get_tasks(tasks=task_names)
+    evaluator = mteb.MTEB(tasks=tasks)
+
+    # === Run evaluation ===
     wrapped = EmbeddingModel(model, tokenizer, device)
+    evaluator.run(wrapped, output_folder=output_folder)
 
-    # === Results container ===
-    results = []
+    # === Visualization: ARI & NMI Bar Chart ===
+    records = []
+    for t in task_names:
+        path = os.path.join(output_folder, t, "metrics.csv")
+        df = pd.read_csv(path)
+        records.append({"task": t, "ARI": df.loc[0, "ARI"], "NMI": df.loc[0, "NMI"]})
+    metrics_df = pd.DataFrame(records)
 
-    # === Process tasks with streaming + incremental stats ===
-    for task in task_names:
-        print(f"\n=== Task: {task} ===")
-        # Streaming load for fitting KMeans
-        ds1 = load_dataset(
-            "mteb", name=task, split="test", streaming=True, cache_dir="./hf_cache"
-        )
-        # Determine number of clusters
-        K = ds1.features['label'].num_classes
-        print(f"Detected {K} clusters.")
-
-        # Incremental clustering
-        kmeans = MiniBatchKMeans(n_clusters=K, batch_size=512, random_state=0)
-        buffer = []
-        for ex in ds1:
-            buffer.append(ex['text'])
-            if len(buffer) == 512:
-                embs = wrapped.encode(buffer)
-                kmeans.partial_fit(embs)
-                buffer.clear()
-        if buffer:
-            embs = wrapped.encode(buffer)
-            kmeans.partial_fit(embs)
-            buffer.clear()
-
-        # Streaming second pass to build contingency matrix
-        ds2 = load_dataset(
-            "mteb", name=task, split="test", streaming=True, cache_dir="./hf_cache"
-        )
-        cont = np.zeros((K, K), dtype=np.int64)
-        buf_texts, buf_labels = [], []
-        for ex in ds2:
-            buf_texts.append(ex['text'])
-            buf_labels.append(ex['label'])
-            if len(buf_texts) == 512:
-                embs = wrapped.encode(buf_texts)
-                preds = kmeans.predict(embs)
-                for true, pred in zip(buf_labels, preds):
-                    cont[true, pred] += 1
-                buf_texts.clear(); buf_labels.clear()
-        if buf_texts:
-            embs = wrapped.encode(buf_texts)
-            preds = kmeans.predict(embs)
-            for true, pred in zip(buf_labels, preds):
-                cont[true, pred] += 1
-
-        # Compute ARI/NMI from contingency matrix
-        n = cont.sum()
-        sum_cij = sum(comb(cont[i, j], 2) for i in range(K) for j in range(K))
-        sum_ci = sum(comb(cont[i, :].sum(), 2) for i in range(K))
-        sum_cj = sum(comb(cont[:, j].sum(), 2) for j in range(K))
-        expected = (sum_ci * sum_cj) / comb(n, 2)
-        max_index = 0.5 * (sum_ci + sum_cj)
-        ari = (sum_cij - expected) / (max_index - expected)
-
-        # NMI
-        h_true = -sum((cont[i, :].sum() / n) * log(cont[i, :].sum() / n) for i in range(K))
-        h_pred = -sum((cont[:, j].sum() / n) * log(cont[:, j].sum() / n) for j in range(K))
-        mutual_info = sum(
-            (cont[i, j] / n) * log((cont[i, j] * n) / (cont[i, :].sum() * cont[:, j].sum()))
-            for i in range(K) for j in range(K) if cont[i, j] > 0
-        )
-        nmi = mutual_info / ((h_true + h_pred) / 2)
-
-        print(f"{task} -> ARI: {ari:.4f}, NMI: {nmi:.4f}")
-        results.append({'task': task, 'ARI': ari, 'NMI': nmi})
-
-    # === Visualization: Bar chart across tasks ===
-    df = pd.DataFrame(results)
-    x = np.arange(len(df))
+    x = np.arange(len(metrics_df))
     width = 0.35
     fig, ax = plt.subplots(figsize=(10, 6))
-    ax.bar(x - width/2, df['ARI'], width, label='ARI')
-    ax.bar(x + width/2, df['NMI'], width, label='NMI')
+    ax.bar(x - width/2, metrics_df["ARI"], width, label="ARI")
+    ax.bar(x + width/2, metrics_df["NMI"], width, label="NMI")
     ax.set_xticks(x)
-    ax.set_xticklabels(df['task'], rotation=45, ha='right')
-    ax.set_ylabel('Score')
-    ax.set_title('Full-data Clustering Metrics')
+    ax.set_xticklabels(metrics_df["task"], rotation=45, ha="right")
+    ax.set_ylabel("Score")
+    ax.set_title("Clustering Metrics Across Tasks")
     ax.legend()
     plt.tight_layout()
     plt.show()
+
+    # === Visualization: t-SNE Scatter (First Task) ===
+    first_task = tasks[0]
+    dataset = first_task.dataset
+    texts = dataset["text"][:1000]
+    true_labels = dataset["label"][:1000]
+    embs = wrapped.encode(texts)
+    k = len(set(true_labels))
+    preds = KMeans(n_clusters=k, random_state=0).fit_predict(embs)
+    proj = TSNE(n_components=2).fit_transform(embs)
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+    axes[0].scatter(proj[:, 0], proj[:, 1], c=true_labels, s=5)
+    axes[0].set_title("True Clusters")
+    axes[1].scatter(proj[:, 0], proj[:, 1], c=preds, s=5)
+    axes[1].set_title("Predicted Clusters")
+    plt.tight_layout()
+    plt.show()
+
+    # === Visualization: Silhouette Plot ===
+    sil_vals = silhouette_samples(embs, preds)
+    avg_sil = silhouette_score(embs, preds)
+    print(f"Average silhouette score: {avg_sil:.3f}")
+
+    fig, ax = plt.subplots(figsize=(6, 4))
+    y_lower = 10
+    for i in range(k):
+        ith_sil = sil_vals[preds == i]
+        ith_sil.sort()
+        size_i = len(ith_sil)
+        y_upper = y_lower + size_i
+        color_i = cm.nipy_spectral(float(i) / k)
+        ax.fill_betweenx(np.arange(y_lower, y_upper), 0, ith_sil, facecolor=color_i, alpha=0.7)
+        ax.text(-0.05, y_lower + 0.5 * size_i, str(i))
+        y_lower = y_upper + 10
+    ax.set_xlabel("Silhouette Coefficient")
+    ax.set_ylabel("Cluster")
+    ax.axvline(x=avg_sil, color="red", linestyle="--")
+    ax.set_title("Silhouette Plot")
+    plt.tight_layout()
+    plt.show()
+
+    # === Visualization: Confusion Matrix ===
+    cmat = confusion_matrix(true_labels, preds)
+    fig, ax = plt.subplots(figsize=(6, 5))
+    cax = ax.matshow(cmat, cmap="Blues")
+    fig.colorbar(cax)
+    for i in range(cmat.shape[0]):
+        for j in range(cmat.shape[1]):
+            ax.text(j, i, cmat[i, j], ha="center", va="center")
+    ax.set_xlabel("Predicted")
+    ax.set_ylabel("True")
+    ax.set_title("Confusion Matrix")
+    plt.tight_layout()
+    plt.show()
+
+if __name__ == "__main__":
+    main()
